@@ -281,3 +281,7 @@ class COVE:
         row_normalize_(cooccurance_csr.indptr, cooccurance_csr.data)
         self.cooccurance_csr_ = cooccurance_csr
         return self
+
+    def fit_transform(self, adjacency):
+        self.fit(adjacency)
+        return self.cooccurance_csr_
