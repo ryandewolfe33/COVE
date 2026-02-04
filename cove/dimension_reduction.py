@@ -7,10 +7,9 @@ from sklearn.decomposition import TruncatedSVD
 
 
 def spectral_layout(
-    data,
     graph,
     dim,
-    rng,
+    random_state,
     init="random",
     method=None,
     tol=0.0,
@@ -199,7 +198,7 @@ class UMAPLE:
             (
                 self.random_state
                 if self.random_state is not None
-                else np.random.RandomState()
+                else np.random.RandomState(seed=self.random_state)
             ),
             metric=self.metric,
         )

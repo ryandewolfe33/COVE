@@ -9,25 +9,6 @@ from numba_progress import ProgressBar
 
 
 @njit(nogil=True)
-def merge_int32s(x: int32, y: int32):
-    """
-    Store two int32s in an int64. The first 32 bits are for x, the second 32 for y.
-    """
-    return (np.int64(x) << 32) | np.int64(y)
-
-
-@njit(nogil=True)
-def split_int32s(x: int64):
-    """
-    Split an int64 into two int32s. Returns a two element tuple of the first and second 32 bits.
-    Opposite of the function merge_int32s
-    """
-    first = np.int32(x >> 32)
-    second = np.int32(x & 0xFFFFFFFF)
-    return first, second
-
-
-@njit(nogil=True)
 def cdf_rows(indptr, data):
     out = np.empty_like(data, dtype="float32")
     for i in range(len(indptr) - 1):
@@ -47,26 +28,25 @@ def _isin_sorted(a, x):
 
 
 @njit(nogil=True, fastmath=True)
-def update_cooccurances(recent, step, window, cooccurances):
-    # print(recent, step, window)
+def update_cooccurances(recent, step, window, n, node_ids, weights, next_coo_id):
     current_id = step % len(recent)
+    n1 = recent[current_id]
     for distance in range(1, len(recent)):
         other_id = current_id - distance
         if other_id < 0:
             if step < len(recent):  # Not enough steps yet for higher distances
                 return
             other_id += len(recent)  # Wrap to back of recent
-        # print(distance, recent[current_id], recent[other_id], window[distance])
-        key = merge_int32s(recent[current_id], recent[other_id])
-        if key not in cooccurances:
-            cooccurances[key] = 0.0
-        cooccurances[key] = cooccurances[key] + window[distance]
-        # Co-occurance is symmetric
-        key = merge_int32s(recent[other_id], recent[current_id])
-        if key not in cooccurances:
-            cooccurances[key] = 0.0
-        cooccurances[key] = cooccurances[key] + window[distance]
-    return
+        n2 = recent[other_id]
+        key = n1 * n + n2
+        # print(f"{n1} {n2}, Key {key}, next_coo_id {next_coo_id[0]}, {len(node_ids)}")
+        node_ids[next_coo_id[0]] = key
+        weights[next_coo_id[0]] = window[distance]
+        next_coo_id[0] += 1
+        key = n2 * n + n1
+        node_ids[next_coo_id[0]] = key
+        weights[next_coo_id[0]] = window[distance]
+        next_coo_id[0] += 1
 
 
 @njit(nogil=True, fastmath=True)
@@ -81,21 +61,25 @@ def sample_walk(
     prob_2,
     walk_length,
     rng,
-    cooccurances,
+    node_ids,
+    weights,
+    next_coo_id
 ):
     # print("Sample Walk: ", source, walk_length)
+    n = len(indptr) - 1
     recent = np.empty_like(window, dtype="int32")
     recent[0] = source
     # Take one step at random before p and q have effects
     neighbors = _neighbors(indptr, indices, source)
     if not neighbors.size:  # In case source is isolated
+        recent[1] = source
+        update_cooccurances(recent, 1, window, n, node_ids, weights, next_coo_id)
         return
     recent[1] = neighbors[
         np.searchsorted(_neighbors(indptr, data, source), rng.uniform())
     ]
-    update_cooccurances(recent, 1, window, cooccurances)
+    update_cooccurances(recent, 1, window, n, node_ids, weights, next_coo_id)
     for step in range(2, walk_length):
-        # print("Step: ", step)
         next_id = step % len(recent)
         current_id = (step - 1) % len(recent)
         prev_id = (step - 2) % len(recent)
@@ -124,28 +108,41 @@ def sample_walk(
                 elif r < prob_2:
                     break
         recent[next_id] = new_node
-        update_cooccurances(recent, step, window, cooccurances)
-    return
+        update_cooccurances(recent, step, window, n, node_ids, weights, next_coo_id)
 
 
-@njit
-def numba_dict_to_csr(numba_dict):
-    row = np.empty(len(numba_dict), dtype="int32")
-    col = np.empty(len(numba_dict), dtype="int32")
-    data = np.empty(len(numba_dict), dtype="float64")
-    i = 0
-    for key, w in numba_dict.items():
-        node1, node2 = split_int32s(key)
-        row[i] = node1
-        col[i] = node2
-        data[i] = w
-        i += 1
-    return row, col, data
-
-
-# TODO make sure there are no isolated nodes
 @njit(nogil=True, fastmath=True)
-def sample_cooccurance_matrix_(
+def sort_merge_format(n, node_ids, weights):
+    # Sort
+    argsort = np.argsort(node_ids)
+    node_ids = node_ids[argsort]
+    weights = weights[argsort]
+    # Merge
+    current_id = -1
+    current_entry = -1
+    for i in range(len(node_ids)):
+        if node_ids[i] == current_entry:
+            weights[current_id] += weights[i]
+        else:
+            current_id += 1
+            current_entry = node_ids[i]
+            node_ids[current_id] = current_entry
+            weights[current_id] = weights[i]
+    # Format
+    indices = node_ids[:current_id+1]
+    data = weights[:current_id+1]
+    indptr = np.empty(n + 1, dtype="int32")
+    pair_id = 0
+    for row_id in range(len(indptr)):
+        indptr[row_id] = pair_id
+        while pair_id < len(indices) and indices[pair_id] < n * (row_id+1):
+            node_ids[pair_id] -= n * row_id
+            pair_id += 1
+    return indptr, indices, data
+    
+
+@njit(nogil=True, fastmath=True)
+def sample_cooccurance_matrix(
     indptr,
     indices,
     data,
@@ -158,11 +155,16 @@ def sample_cooccurance_matrix_(
     rng,
     progress_bar,
 ):
-    cooccurances = Dict.empty(
-        key_type=int64, value_type=float64, n_keys=(len(indptr) - 1) * 100
-    )
-    for source in prange(len(indptr) - 1):
-        for _ in prange(walks_per_node):
+    n = len(indptr) - 1
+    #TODO split array across threads
+    #TODO save memory by merging early (how often?)
+    max_num_cooccurances = n * walks_per_node * walk_length * (len(window)-1) * 2
+    # Slight over-count for boundaries and any walks that get stuck
+    node_ids = np.empty(max_num_cooccurances, dtype="int64")
+    weights = np.zeros(max_num_cooccurances, dtype="float32")
+    next_coo_id = np.zeros(1, dtype="int64")
+    for source in range(n):
+        for _ in range(walks_per_node):
             sample_walk(
                 source,
                 indptr,
@@ -174,11 +176,13 @@ def sample_cooccurance_matrix_(
                 prob_2,
                 walk_length,
                 rng,
-                cooccurances,
+                node_ids,
+                weights,
+                next_coo_id
             )
             progress_bar.update()
-    row, col, data = numba_dict_to_csr(cooccurances)
-    return row, col, data
+    indptr, indices, data = sort_merge_format(n, node_ids, weights)
+    return indptr, indices, data
 
 
 @njit
@@ -214,18 +218,26 @@ class COVE:
 
     Parameters
     ----------
-    window : the sliding window over each random walk storing weights for each co-occurance distance
+    p:float=1.0 - p parameter for node2vec biased random walk
+    q:float=1.0 - q parameter for node2vec biased random walk
+    walks_per_node:int=10 - number of walks to start at each node
+    walk_length:int=40 - length of each walk
+    window:(list or array)=None - co-occurrence window to slide over each random walk storing. Overrides window_type and window_length if present.
+    window_type:str="flat" - window kernel, choice of "flat", "ppr", or "hk"
+    window_length:int=7 - window radius (i.e. max co-occurrence distance)
+    alpha:float=0.85 - alpha parameter for ppr window type
+    t:float=3 - temperature parameter for hk window type
+    verbose:bool=False - print info (including progress bars)
     """
-
     def __init__(
         self,
         p=1.0,
         q=1.0,
-        walks_per_node=20,
-        walk_length=80,
+        walks_per_node=10,
+        walk_length=40,
         window=None,
         window_type="flat",
-        window_length=5,
+        window_length=7,
         alpha=0.85,
         t=3,
         rng=None,
@@ -253,7 +265,7 @@ class COVE:
             self.rng = np.random.default_rng()
         self.verbose = verbose
 
-    def fit(self, adjacency):
+    def fit(self, adjacency, m=1):
         # Pre-compute probability of acceptance
         max_prob = max(1 / self.p, 1, 1 / self.q)
         prob_0 = 1 / self.p / max_prob
@@ -264,7 +276,7 @@ class COVE:
             total=len(adjacency.indptr) - 1 * self.walks_per_node,
             disable=not self.verbose,
         ) as progress_bar:
-            row, col, data = sample_cooccurance_matrix_(
+            indptr, indices, data = sample_cooccurance_matrix(
                 adjacency.indptr,
                 adjacency.indices,
                 neighbor_cdfs,
@@ -277,9 +289,8 @@ class COVE:
                 self.rng,
                 progress_bar,
             )
-        cooccurance_csr = sp.csr_matrix((data, (row, col)), shape=adjacency.shape)
-        row_normalize_(cooccurance_csr.indptr, cooccurance_csr.data)
-        self.cooccurance_csr_ = cooccurance_csr
+        self.cooccurance_csr_ = sp.csr_matrix((data, indices, indptr), shape=adjacency.shape)
+        row_normalize_(self.cooccurance_csr_.indptr, self.cooccurance_csr_.data)
         return self
 
     def fit_transform(self, adjacency):
