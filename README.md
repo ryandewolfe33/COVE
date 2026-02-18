@@ -37,6 +37,5 @@ labels = [i for i,block_size in enumerate(block_sizes) for _ in range(block_size
 plt.scatter(data_map[:, 0], data_map[:, 1], c=labels)
 ```
 
-We
-
-There are also more complicated example available in the experiments folder, but be warned they are not polished.
+## Pre-print
+Coming Soon!
