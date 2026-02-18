@@ -48,7 +48,15 @@ def node2vec(
 
 
 def abcd(n, xi, nout=0):
-    params = abcd_graph.ABCDParams(vcount=n, xi=xi, num_outliers=nout, min_degree=3, max_degree=int(np.sqrt(n)), min_community_size=15, max_community_size=10*int(np.sqrt(n)))
+    params = abcd_graph.ABCDParams(
+        vcount=n,
+        xi=xi,
+        num_outliers=nout,
+        min_degree=3,
+        max_degree=int(np.sqrt(n)),
+        min_community_size=15,
+        max_community_size=10*int(np.sqrt(n))
+    )
     graph = abcd_graph.ABCDGraph(params).build()
     labels = np.empty(n, dtype="int32")
     for i, com in enumerate(graph.communities):
@@ -59,10 +67,15 @@ def abcd(n, xi, nout=0):
     return adjacency, labels
 
 
-def load_graph(name):
+def load_graph(name, force_sparse=False):
     adjacency = sp.load_npz(f"data/{name}_adjacency.npz")
     try:
         labels = np.load(f"data/{name}_labels.npy")
+        if force_sparse:
+            labels_sparse = sp.lil_array((np.max(labels)+1, adjacency.shape[0]), dtype="bool")
+            for l in range(np.max(labels)+1):
+                labels_sparse[l, labels==l] = True
+            labels = labels_sparse.tocsr()
     except FileNotFoundError as e:
         try:
             labels = sp.load_npz(f"data/{name}_labels.npz")
@@ -85,7 +98,10 @@ def JS(adjacency, embedding, julia, cge, labels=None, random_state=None):
             print(line, file=f)
     np.savetxt(f"emb.dat", embedding, fmt="%.10f")
     np.savetxt("labels.dat", labels, fmt="%d")
-    cmd = julia+' '+cge+' -g '+edgelist_file+' -c labels.dat -e emb.dat --seed '+str(random_state.randint(2**32))+' 2>_stderr'
+    cmd = julia+' '+cge+' -g '+edgelist_file+' -c labels.dat -e emb.dat --seed '+str(random_state.randint(2**32))
+    if adjacency.shape[0] > 3000:
+        cmd += ' -l 1000'
+    cmd += ' 2>_stderr'
     s = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE)
     x = s.stdout.decode().split(',')
     # Delete temp files
